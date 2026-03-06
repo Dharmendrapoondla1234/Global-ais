@@ -1,17 +1,25 @@
 """
-ais_bridge.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WebSocket → REST bridge for Google Apps Script
+AIS WebSocket → REST Bridge
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. Connects to aisstream.io WebSocket permanently
-2. Buffers last N messages in memory
-3. Exposes GET /snapshot → returns buffered messages as JSON
-4. Apps Script polls GET /snapshot every 1 minute
+Purpose
+-------
+Connects to AISStream WebSocket and exposes a REST API
+so Google Apps Script can poll vessel data.
 
-Deploy on: Cloud Run / Render / Railway (free tier)
+Flow
+----
+AISStream WebSocket
+        ↓
+Python bridge buffers messages
+        ↓
+Apps Script polls /snapshot every minute
 
-pip install flask websockets asyncio threading python-dotenv
-python ais_bridge.py
+Deploy on:
+Cloud Run / Render / Railway / VPS
+
+Install:
+pip install flask websockets python-dotenv
 """
 
 import asyncio
@@ -24,97 +32,172 @@ from collections import deque
 from flask import Flask, jsonify
 from dotenv import load_dotenv
 
+# ─────────────────────────────────────────
+# ENVIRONMENT
+# ─────────────────────────────────────────
+
 load_dotenv()
 
-API_KEY    = os.getenv("AISSTREAM_API_KEY", "")
-PORT       = int(os.getenv("PORT", "8080"))
-MAX_BUFFER = int(os.getenv("MAX_BUFFER", "1000"))  # keep last 1000 messages
+API_KEY = os.getenv("AISSTREAM_API_KEY", "")
+PORT = int(os.getenv("PORT", "8080"))
 
-# ── Shared buffer (thread-safe deque) ─────────────────────────────
+# buffer size for global AIS stream
+MAX_BUFFER = int(os.getenv("MAX_BUFFER", "20000"))
+
+# ─────────────────────────────────────────
+# SHARED MEMORY BUFFER
+# ─────────────────────────────────────────
+
 message_buffer = deque(maxlen=MAX_BUFFER)
-buffer_lock    = threading.Lock()
-last_updated   = None
+buffer_lock = threading.Lock()
 
-# ── Flask REST API ─────────────────────────────────────────────────
+last_updated = None
+message_count = 0
+
+# ─────────────────────────────────────────
+# FLASK REST API
+# ─────────────────────────────────────────
+
 app = Flask(__name__)
+
 
 @app.route("/", methods=["GET"])
 def health():
+    """Health check"""
     return jsonify({
-        "status":       "ok",
-        "buffer_size":  len(message_buffer),
+        "status": "running",
+        "buffer_size": len(message_buffer),
+        "messages_received": message_count,
         "last_updated": str(last_updated)
     })
+
 
 @app.route("/snapshot", methods=["GET"])
 def snapshot():
     """
-    Apps Script calls this endpoint every minute.
-    Returns all buffered messages and clears the buffer.
+    Returns buffered AIS messages
+    and clears the buffer.
     """
+
     global last_updated
+
     with buffer_lock:
         messages = list(message_buffer)
-        message_buffer.clear()  # clear after serving so no duplicates next call
+        message_buffer.clear()
 
     return jsonify({
-        "count":        len(messages),
+        "count": len(messages),
         "last_updated": str(last_updated),
-        "messages":     messages
+        "messages": messages
     })
 
-# ── AIS WebSocket listener (runs in background thread) ────────────
-async def listen_ais():
-    global last_updated
 
-    subscribe = {
-        "APIKey":             API_KEY,
-        "BoundingBoxes":      [[[-90, -180], [90, 180]]],  # global
-        "FilterMessageTypes": ["PositionReport", "ShipStaticData",
-                               "StandardClassBPositionReport"]
+# ─────────────────────────────────────────
+# AIS WEBSOCKET LISTENER
+# ─────────────────────────────────────────
+
+async def listen_ais():
+
+    global last_updated
+    global message_count
+
+    subscribe_message = {
+        "APIKey": API_KEY,
+
+        # GLOBAL COVERAGE
+        "BoundingBoxes": [
+            [[-180, -90], [180, 90]]
+        ],
+
+        "FilterMessageTypes": [
+            "PositionReport",
+            "ShipStaticData",
+            "StandardClassBPositionReport"
+        ]
     }
 
-    print(f"[AIS Bridge] Connecting to aisstream.io...")
+    print("🌍 AIS Bridge starting...")
+    print("📡 Connecting to AISStream WebSocket...")
 
     while True:
+
         try:
+
             async with websockets.connect(
                 "wss://stream.aisstream.io/v0/stream",
                 ping_interval=20,
-                ping_timeout=30
+                ping_timeout=30,
+                max_size=None
             ) as ws:
-                await ws.send(json.dumps(subscribe))
-                print("[AIS Bridge] ✅ Connected — receiving global AIS stream")
 
-                async for raw in ws:
+                print("✅ Connected to AISStream")
+
+                await ws.send(json.dumps(subscribe_message))
+
+                async for raw_message in ws:
+
                     try:
-                        msg = json.loads(raw)
-                        msg["_received_at"] = datetime.now(timezone.utc).isoformat()
+
+                        message = json.loads(raw_message)
+
+                        message["_received_at"] = datetime.now(
+                            timezone.utc).isoformat()
 
                         with buffer_lock:
-                            message_buffer.append(msg)
+                            message_buffer.append(message)
 
-                        last_updated = datetime.now(timezone.utc).isoformat()
+                        last_updated = datetime.now(
+                            timezone.utc).isoformat()
 
-                    except Exception as e:
-                        print(f"[AIS Bridge] Parse error: {e}")
+                        message_count += 1
 
-        except Exception as e:
-            print(f"[AIS Bridge] Disconnected: {e} — reconnecting in 5s...")
+                        if message_count % 1000 == 0:
+                            print(
+                                f"📦 Received {message_count} AIS messages")
+
+                    except Exception as parse_error:
+
+                        print("Parse error:", parse_error)
+
+        except Exception as connection_error:
+
+            print("⚠️ WebSocket disconnected:", connection_error)
+            print("🔁 Reconnecting in 5 seconds...")
+
             await asyncio.sleep(5)
 
-def start_websocket_thread():
-    """Run the async WebSocket listener in a background thread."""
+
+# ─────────────────────────────────────────
+# BACKGROUND THREAD
+# ─────────────────────────────────────────
+
+def start_websocket():
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
     loop.run_until_complete(listen_ais())
 
-# ── START ──────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────
+# MAIN ENTRY
+# ─────────────────────────────────────────
+
 if __name__ == "__main__":
-    # Start WebSocket listener in background
-    t = threading.Thread(target=start_websocket_thread, daemon=True)
-    t.start()
-    print(f"[AIS Bridge] 🌍 REST API running on port {PORT}")
-    print(f"[AIS Bridge] 📡 Poll endpoint: GET /snapshot")
-    # Start Flask
-    app.run(host="0.0.0.0", port=PORT)
+
+    # start websocket thread
+    ws_thread = threading.Thread(
+        target=start_websocket,
+        daemon=True
+    )
+
+    ws_thread.start()
+
+    print("🚀 AIS Bridge REST API started")
+    print(f"📡 Poll endpoint → http://localhost:{PORT}/snapshot")
+
+    # start flask server
+    app.run(
+        host="0.0.0.0",
+        port=PORT
+    )
