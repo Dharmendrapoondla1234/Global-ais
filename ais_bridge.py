@@ -142,20 +142,20 @@
 
 
 """
-AIS WebSocket → REST Bridge (Asia Edition)
+AIS WebSocket → REST Bridge (Asia Edition v2)
 Dedicated stream for Southeast Asia + East Asia real-time coverage.
-Covers: Indonesia, Malaysia, Singapore, Philippines, Vietnam,
-        Thailand, China, Japan, South Korea, India (east coast)
+Fixed: better WebSocket headers, SSL handling, and Render compatibility.
 
-Deploy this as a SEPARATE Render service alongside the global bridge.
 pip install flask websockets python-dotenv
 """
 
 import asyncio
 import websockets
+import websockets.exceptions
 import json
 import threading
 import os
+import ssl
 from datetime import datetime, timezone
 from collections import deque
 from flask import Flask, jsonify
@@ -173,25 +173,15 @@ last_updated   = None
 message_count  = 0
 ws_status      = "starting"
 ws_error       = ""
+connect_attempts = 0
 
 app = Flask(__name__)
 
-# ── Asia Bounding Boxes ───────────────────────────────────────────────────────
-# Each box = [[min_lat, min_lng], [max_lat, max_lng]]
-# Split into sub-regions so aisstream.io doesn't throttle a single huge box
-
 ASIA_BOUNDING_BOXES = [
-    # Southeast Asia core (Singapore Strait, Malacca, Indonesia, Philippines)
-    [[-10, 95], [25, 140]],
-
-    # East Asia (China coast, Japan, South Korea, Taiwan)
-    [[20, 118], [45, 148]],
-
-    # South Asia / Bay of Bengal / Indian Ocean east (India east coast, Sri Lanka, Bangladesh)
-    [[-5, 72], [25, 95]],
-
-    # Persian Gulf + Arabian Sea + Red Sea (Middle East shipping lanes)
-    [[10, 40], [30, 65]],
+    [[-10, 95],  [25, 140]],   # Southeast Asia
+    [[20,  118], [45, 148]],   # East Asia
+    [[-5,  72],  [25, 95]],    # South Asia / Bay of Bengal
+    [[10,  40],  [30, 65]],    # Persian Gulf / Arabian Sea
 ]
 
 REGION_LABEL = "Asia-Pacific"
@@ -205,6 +195,7 @@ def health():
         "ws_error":          ws_error,
         "buffer_size":       len(message_buffer),
         "messages_received": message_count,
+        "connect_attempts":  connect_attempts,
         "last_updated":      str(last_updated),
         "api_key_set":       bool(API_KEY),
         "api_key_prefix":    API_KEY[:8] if API_KEY else "NOT SET",
@@ -224,7 +215,7 @@ def snapshot():
     })
 
 async def listen_ais():
-    global last_updated, message_count, ws_status, ws_error
+    global last_updated, message_count, ws_status, ws_error, connect_attempts
 
     subscribe_message = {
         "APIKey": API_KEY,
@@ -236,29 +227,40 @@ async def listen_ais():
         ]
     }
 
+    # Permissive SSL context for Render compatibility
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
     print(f"🔑 API Key: {API_KEY[:8]}..." if API_KEY else "❌ NO API KEY")
     print(f"🌏 Starting {REGION_LABEL} AIS connection...")
-    print(f"📦 Monitoring {len(ASIA_BOUNDING_BOXES)} sub-regions")
 
     retry_wait = 5
 
     while True:
+        connect_attempts += 1
         try:
             ws_status = "connecting"
-            print(f"📡 Connecting to aisstream.io... (retry_wait={retry_wait}s)")
+            print(f"📡 Attempt #{connect_attempts} connecting to aisstream.io...")
 
             async with websockets.connect(
                 "wss://stream.aisstream.io/v0/stream",
-                ping_interval=None,
+                ssl=ssl_context,
+                ping_interval=20,
+                ping_timeout=30,
                 close_timeout=10,
                 max_size=None,
-                open_timeout=30
+                open_timeout=60,
+                additional_headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Origin": "https://aisstream.io"
+                }
             ) as ws:
 
                 ws_status  = "connected"
                 ws_error   = ""
                 retry_wait = 5
-                print("✅ Connected! Sending Asia subscription...")
+                print(f"✅ Connected on attempt #{connect_attempts}!")
 
                 await ws.send(json.dumps(subscribe_message))
                 print(f"📡 Subscribed — receiving {REGION_LABEL} AIS stream...")
@@ -275,16 +277,30 @@ async def listen_ais():
                         last_updated   = datetime.now(timezone.utc).isoformat()
                         message_count += 1
 
-                        if message_count % 500 == 0:
+                        if message_count % 100 == 0:
                             print(f"📦 {message_count:,} messages | buffer: {len(message_buffer):,}")
 
                     except Exception as e:
                         print(f"Parse error: {e}")
 
+        except websockets.exceptions.InvalidStatusCode as e:
+            ws_status = "rejected"
+            ws_error  = f"HTTP {e.status_code} — API key rejected or rate limited"
+            print(f"❌ {ws_error}")
+            await asyncio.sleep(retry_wait)
+            retry_wait = min(retry_wait * 2, 120)
+
         except asyncio.TimeoutError:
             ws_status = "timeout"
-            ws_error  = "Connection timed out"
-            print(f"⚠️  Timeout — retrying in {retry_wait}s...")
+            ws_error  = f"Timeout on attempt #{connect_attempts}"
+            print(f"⚠️  {ws_error} — retrying in {retry_wait}s...")
+            await asyncio.sleep(retry_wait)
+            retry_wait = min(retry_wait * 2, 60)
+
+        except OSError as e:
+            ws_status = "network_error"
+            ws_error  = f"Network error: {str(e)}"
+            print(f"⚠️  {ws_error} — retrying in {retry_wait}s...")
             await asyncio.sleep(retry_wait)
             retry_wait = min(retry_wait * 2, 60)
 
